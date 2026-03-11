@@ -5,6 +5,7 @@ from datetime import date
 import cdsapi
 import tempfile
 import os
+from dateutil.relativedelta import relativedelta
 
 st.set_page_config(page_title="Correcteur Ensoleillement PV", page_icon="☀️", layout="wide")
 
@@ -41,84 +42,116 @@ if st.button("🔍 Récupérer l'ensoleillement CAMS et corriger", type="primary
         st.error("La date de début doit être avant la date de fin.")
     else:
         try:
-            status = st.empty()
-            status.text("Connexion à CAMS en cours...")
-
             cams_url = st.secrets["CAMS_URL"]
             cams_key = st.secrets["CAMS_KEY"]
 
+            # Construire la liste de tous les mois entre start_date et end_date
+            months = []
+            current = date(start_date.year, start_date.month, 1)
+            end_month = date(end_date.year, end_date.month, 1)
+            while current <= end_month:
+                months.append(current)
+                current += relativedelta(months=1)
+
+            total = len(months)
+            progress = st.progress(0)
+            status = st.empty()
+
+            all_data = []
+            irr_col = None
+
+            c = cdsapi.Client(url=cams_url, key=cams_key, quiet=True)
+
             with tempfile.TemporaryDirectory() as tmpdir:
-                output_path = os.path.join(tmpdir, "cams_result.csv")
+                for i, month_start in enumerate(months):
+                    month_end = month_start + relativedelta(months=1) - relativedelta(days=1)
+                    # Ne pas dépasser end_date
+                    month_end = min(month_end, end_date)
+                    # Ne pas commencer avant start_date
+                    m_start = max(month_start, start_date)
 
-                status.text("Envoi de la requête à CAMS (peut prendre 1 à 2 minutes)...")
+                    status.text(f"Récupération {m_start.strftime('%B %Y')} ({i+1}/{total})...")
 
-                c = cdsapi.Client(url=cams_url, key=cams_key, quiet=True)
+                    output_path = os.path.join(tmpdir, f"cams_{m_start.strftime('%Y_%m')}.csv")
 
-                c.retrieve(
-                    "cams-solar-radiation-timeseries",
-                    {
-                        "sky_type": "observed_cloud",
-                        "location": {
-                            "latitude": float(lat),
-                            "longitude": float(lon)
+                    c.retrieve(
+                        "cams-solar-radiation-timeseries",
+                        {
+                            "sky_type": "observed_cloud",
+                            "location": {
+                                "latitude": float(lat),
+                                "longitude": float(lon)
+                            },
+                            "altitude": "-999.",
+                            "date": f"{m_start.strftime('%Y-%m-%d')}/{month_end.strftime('%Y-%m-%d')}",
+                            "time_step": "1day",
+                            "time_reference": "universal_time",
+                            "format": "csv",
                         },
-                        "altitude": "-999.",
-                        "date": f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}",
-                        "time_step": "1day",
-                        "time_reference": "universal_time",
-                        "format": "csv",
-                    },
-                    output_path
-                )
+                        output_path
+                    )
 
-                status.text("Données reçues, traitement en cours...")
+                    # Lire le CSV en ignorant les commentaires #
+                    with open(output_path, "r") as f:
+                        lines = f.readlines()
 
-                with open(output_path, "r") as f:
-                    lines = f.readlines()
+                    data_start = 0
+                    for j, line in enumerate(lines):
+                        if not line.startswith("#"):
+                            data_start = j
+                            break
 
-                data_start = 0
-                for j, line in enumerate(lines):
-                    if not line.startswith("#"):
-                        data_start = j
-                        break
+                    df_month = pd.read_csv(output_path, skiprows=data_start, sep=";", decimal=".", on_bad_lines="skip")
+                    df_month.columns = [col.strip() for col in df_month.columns]
 
-                df_raw = pd.read_csv(output_path, skiprows=data_start, sep=";", on_bad_lines="skip")
-                df_raw.columns = [c.strip() for c in df_raw.columns]
+                    # Identifier la colonne irradiance une seule fois
+                    if irr_col is None:
+                        # Chercher GHI actual weather (pas cloud-free GHIcs)
+                        # Colonnes CAMS : GHI=actual, GHIcs=clear sky, BHI, DHI, BNI
+                        for candidate in ["GHI", "ghi"]:
+                            if candidate in df_month.columns:
+                                irr_col = candidate
+                                break
+                        if irr_col is None:
+                            st.error("Colonne GHI non trouvée. Colonnes disponibles : " + str(list(df_month.columns)))
+                            st.stop()
 
-                with st.expander("🔧 Diagnostic — colonnes disponibles dans CAMS"):
-                    st.write(list(df_raw.columns))
-                    st.dataframe(df_raw.head(5))
-
-                date_col = df_raw.columns[0]
-
-                irr_col = None
-                for candidate in ["GHI", "ghi", "G(i)", "Gi", "SRIS", "Global_horizontal_irradiance", "Radiation"]:
-                    if candidate in df_raw.columns:
-                        irr_col = candidate
-                        break
-
-                if irr_col is None:
-                    irr_col = df_raw.columns[1]
-                    st.warning(f"Colonne irradiance non identifiée automatiquement → utilisation de : **{irr_col}**")
-                else:
-                    st.success(f"Colonne irradiance utilisée : **{irr_col}**")
-
-                df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce")
-                df_raw = df_raw.dropna(subset=[date_col])
-                df_raw["Année"] = df_raw[date_col].dt.year
-                df_raw[irr_col] = pd.to_numeric(df_raw[irr_col], errors="coerce")
-
-                df_yearly = df_raw.groupby("Année")[irr_col].sum().reset_index()
-                df_yearly.columns = ["Année", "Gi réel (kWh/m²/an)"]
-                df_yearly["Gi réel (kWh/m²/an)"] = (df_yearly["Gi réel (kWh/m²/an)"] / 1000).round(1)
+                    all_data.append(df_month)
+                    progress.progress((i + 1) / total)
 
             status.empty()
+            progress.empty()
 
+            # Assembler toutes les données
+            df_raw = pd.concat(all_data, ignore_index=True)
+
+            date_col = df_raw.columns[0]
+            df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce")
+            df_raw = df_raw.dropna(subset=[date_col])
+            df_raw["Année"] = df_raw[date_col].dt.year
+            df_raw[irr_col] = pd.to_numeric(df_raw[irr_col], errors="coerce")
+
+            # Diagnostic
+            with st.expander("🔧 Diagnostic technique"):
+                st.write(f"Colonne irradiance utilisée : **{irr_col}**")
+                st.write(f"Nombre de jours récupérés : {len(df_raw)}")
+                st.write(f"Exemple valeur journalière brute (Wh/m²) : {df_raw[irr_col].iloc[0]}")
+                st.dataframe(df_raw.head(10))
+
+            # Somme annuelle Wh/m²/jour → kWh/m²/an
+            df_yearly = df_raw.groupby("Année")[irr_col].sum().reset_index()
+            df_yearly.columns = ["Année", "Gi réel (kWh/m²/an)"]
+            df_yearly["Gi réel (kWh/m²/an)"] = (df_yearly["Gi réel (kWh/m²/an)"] / 1000).round(1)
+
+            # Calculs de correction
             avg = df_yearly["Gi réel (kWh/m²/an)"].mean()
             df_yearly["Écart vs moyenne (%)"] = ((df_yearly["Gi réel (kWh/m²/an)"] - avg) / avg * 100).round(1)
             df_yearly["Ratio vs Archelios (%)"] = (df_yearly["Gi réel (kWh/m²/an)"] / arch_irradiance * 100).round(1)
-            df_yearly["Production corrigée (kWh/an)"] = (arch_production * df_yearly["Gi réel (kWh/m²/an)"] / arch_irradiance).round(0).astype(int)
+            df_yearly["Production corrigée (kWh/an)"] = (
+                arch_production * df_yearly["Gi réel (kWh/m²/an)"] / arch_irradiance
+            ).round(0).astype(int)
 
+            # --- RÉSULTATS ---
             st.header("3. Résultats")
 
             m1, m2, m3 = st.columns(3)
@@ -131,18 +164,23 @@ if st.button("🔍 Récupérer l'ensoleillement CAMS et corriger", type="primary
             st.dataframe(df_yearly, use_container_width=True)
 
             st.subheader("Ensoleillement réel vs Archelios")
-            fig = px.bar(df_yearly, x="Année", y="Gi réel (kWh/m²/an)", color="Écart vs moyenne (%)", color_continuous_scale="RdYlGn")
-            fig.add_hline(y=arch_irradiance, line_dash="dash", line_color="blue", annotation_text=f"Archelios : {arch_irradiance} kWh/m²/an")
-            fig.add_hline(y=avg, line_dash="dot", line_color="orange", annotation_text=f"Moyenne réelle : {avg:.1f} kWh/m²/an")
+            fig = px.bar(df_yearly, x="Année", y="Gi réel (kWh/m²/an)",
+                         color="Écart vs moyenne (%)", color_continuous_scale="RdYlGn")
+            fig.add_hline(y=arch_irradiance, line_dash="dash", line_color="blue",
+                          annotation_text=f"Archelios : {arch_irradiance} kWh/m²/an")
+            fig.add_hline(y=avg, line_dash="dot", line_color="orange",
+                          annotation_text=f"Moyenne réelle : {avg:.1f} kWh/m²/an")
             st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Production corrigée par année")
             fig2 = px.line(df_yearly, x="Année", y="Production corrigée (kWh/an)", markers=True)
-            fig2.add_hline(y=arch_production, line_dash="dash", line_color="blue", annotation_text=f"Production Archelios : {arch_production:,.0f} kWh/an")
+            fig2.add_hline(y=arch_production, line_dash="dash", line_color="blue",
+                           annotation_text=f"Production Archelios : {arch_production:,.0f} kWh/an")
             st.plotly_chart(fig2, use_container_width=True)
 
             csv = df_yearly.to_csv(index=False, sep=";", decimal=",").encode("utf-8")
-            st.download_button("📥 Télécharger les résultats (CSV)", data=csv, file_name="correction_ensoleillement.csv", mime="text/csv")
+            st.download_button("📥 Télécharger les résultats (CSV)", data=csv,
+                               file_name="correction_ensoleillement.csv", mime="text/csv")
 
             st.info("💡 Production corrigée = Production Archelios × (Gi réel / Gi Archelios)")
 
