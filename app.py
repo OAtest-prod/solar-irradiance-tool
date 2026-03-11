@@ -102,13 +102,21 @@ if st.button("🔍 Récupérer l'ensoleillement CAMS et corriger", type="primary
                             break
 
                     df_month = pd.read_csv(output_path, skiprows=data_start, sep=";", decimal=".", on_bad_lines="skip")
-                    df_month.columns = [col.strip() for col in df_month.columns]
+                    # Nommer les colonnes manuellement selon le format CAMS
+                    cams_cols = ["Timestamp", "GHI", "BHI", "DHI", "BNI", "GHIcs", "BHIcs", "DHIcs", "BNIcs", "reliability"]
+                    if len(df_month.columns) == len(cams_cols):
+                        df_month.columns = cams_cols
+                    elif len(df_month.columns) > len(cams_cols):
+                        df_month.columns = cams_cols + [f"col_{i}" for i in range(len(df_month.columns) - len(cams_cols))]
+                    else:
+                        df_month.columns = cams_cols[:len(df_month.columns)]
 
                     # Identifier la colonne irradiance une seule fois
                     if irr_col is None:
                         # Chercher GHI actual weather (pas cloud-free GHIcs)
                         # Colonnes CAMS : GHI=actual, GHIcs=clear sky, BHI, DHI, BNI
-                        for candidate in ["GHI", "ghi"]:
+                        # GHI = colonne 1 = actual weather conditions (GHIcs = clear sky à éviter)
+                        for candidate in ["GHI"]:
                             if candidate in df_month.columns:
                                 irr_col = candidate
                                 break
