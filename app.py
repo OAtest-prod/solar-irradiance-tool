@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
+from datetime import date
 
 st.set_page_config(page_title="Correcteur Ensoleillement PV", page_icon="☀️", layout="wide")
 
@@ -21,9 +22,9 @@ with col2:
 
 col3, col4 = st.columns(2)
 with col3:
-    start_year = st.number_input("Année de début", min_value=2005, max_value=2023, value=2010)
+    start_date = st.date_input("Date de début", value=date(2010, 1, 1), min_value=date(2005, 1, 1), max_value=date(2023, 12, 31))
 with col4:
-    end_year = st.number_input("Année de fin", min_value=2005, max_value=2023, value=2023)
+    end_date = st.date_input("Date de fin", value=date(2023, 12, 31), min_value=date(2005, 1, 1), max_value=date(2023, 12, 31))
 
 # --- DONNÉES ARCHELIOS ---
 st.header("2. Données Archelios Calc")
@@ -37,32 +38,62 @@ with col6:
 # --- BOUTON ---
 if st.button("🔍 Récupérer l'ensoleillement et corriger", type="primary"):
 
-    if start_year > end_year:
-        st.error("L'année de début doit être inférieure à l'année de fin.")
+    if start_date >= end_date:
+        st.error("La date de début doit être avant la date de fin.")
     else:
         results = []
         errors = []
+        found_field = None
+
+        start_year = start_date.year
+        end_year = end_date.year
+        total = end_year - start_year + 1
 
         progress = st.progress(0)
         status = st.empty()
-        total = end_year - start_year + 1
 
-        for i, year in enumerate(range(int(start_year), int(end_year) + 1)):
+        for i, year in enumerate(range(start_year, end_year + 1)):
             status.text(f"Récupération de l'année {year}...")
+
             try:
                 url = "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc"
                 params = {
-                    "lat": lat, "lon": lon,
-                    "angle": tilt, "aspect": azimuth,
-                    "startyear": year, "endyear": year,
-                    "outputformat": "json", "browser": 0
+                    "lat": lat,
+                    "lon": lon,
+                    "angle": tilt,
+                    "aspect": azimuth,
+                    "startyear": year,
+                    "endyear": year,
+                    "outputformat": "json",
+                    "browser": 0,
+                    "components": 1,
                 }
-                res = requests.get(url, params=params, timeout=30)
+                res = requests.get(url, params=params, timeout=60)
                 res.raise_for_status()
                 data = res.json()
                 hourly = data["outputs"]["hourly"]
-                ghi = sum(h.get("G_i", 0) for h in hourly) / 1000
-                results.append({"Année": year, "Gi réel (kWh/m²/an)": round(ghi, 1)})
+
+                # Identifier le bon champ irradiance sur plan incliné
+                if found_field is None:
+                    for field in ["G(i)", "Gb(i)", "Gi", "G_i", "H(i)"]:
+                        if field in hourly[0]:
+                            found_field = field
+                            break
+
+                if found_field:
+                    ghi_sum = sum(h.get(found_field, 0) for h in hourly) / 1000
+                else:
+                    # Reconstituer depuis composantes Gb + Gd + Gr
+                    ghi_sum = sum(
+                        h.get("Gb(i)", 0) + h.get("Gd(i)", 0) + h.get("Gr(i)", 0)
+                        for h in hourly
+                    ) / 1000
+
+                results.append({
+                    "Année": year,
+                    "Gi réel (kWh/m²/an)": round(ghi_sum, 1)
+                })
+
             except Exception as e:
                 errors.append(f"Année {year} : {str(e)}")
 
@@ -80,8 +111,10 @@ if st.button("🔍 Récupérer l'ensoleillement et corriger", type="primary"):
             avg = df["Gi réel (kWh/m²/an)"].mean()
 
             df["Écart vs moyenne (%)"] = ((df["Gi réel (kWh/m²/an)"] - avg) / avg * 100).round(1)
-            df["Ratio ensoleillement (%)"] = (df["Gi réel (kWh/m²/an)"] / arch_irradiance * 100).round(1)
-            df["Production corrigée (kWh/an)"] = (arch_production * df["Gi réel (kWh/m²/an)"] / arch_irradiance).round(0).astype(int)
+            df["Ratio vs Archelios (%)"] = (df["Gi réel (kWh/m²/an)"] / arch_irradiance * 100).round(1)
+            df["Production corrigée (kWh/an)"] = (
+                arch_production * df["Gi réel (kWh/m²/an)"] / arch_irradiance
+            ).round(0).astype(int)
 
             # --- RÉSULTATS ---
             st.header("3. Résultats")
@@ -89,30 +122,40 @@ if st.button("🔍 Récupérer l'ensoleillement et corriger", type="primary"):
             m1, m2, m3 = st.columns(3)
             m1.metric("Ensoleillement moyen réel", f"{avg:.1f} kWh/m²/an")
             m2.metric("Ensoleillement Archelios", f"{arch_irradiance:.1f} kWh/m²/an")
-            m3.metric("Écart global", f"{((avg - arch_irradiance) / arch_irradiance * 100):.1f} %")
+            ecart = (avg - arch_irradiance) / arch_irradiance * 100
+            m3.metric("Écart global", f"{ecart:.1f} %", delta=f"{ecart:.1f} %")
 
             st.subheader("Tableau de correction")
             st.dataframe(df, use_container_width=True)
 
-            st.subheader("Graphique — Ensoleillement réel vs Archelios")
-            fig = px.bar(df, x="Année", y="Gi réel (kWh/m²/an)", color="Écart vs moyenne (%)",
-                         color_continuous_scale="RdYlGn",
-                         labels={"Gi réel (kWh/m²/an)": "kWh/m²/an"})
+            st.subheader("Ensoleillement réel vs Archelios")
+            fig = px.bar(df, x="Année", y="Gi réel (kWh/m²/an)",
+                         color="Écart vs moyenne (%)",
+                         color_continuous_scale="RdYlGn")
             fig.add_hline(y=arch_irradiance, line_dash="dash", line_color="blue",
                           annotation_text=f"Archelios : {arch_irradiance} kWh/m²/an")
             fig.add_hline(y=avg, line_dash="dot", line_color="orange",
                           annotation_text=f"Moyenne réelle : {avg:.1f} kWh/m²/an")
             st.plotly_chart(fig, use_container_width=True)
 
-            st.subheader("Graphique — Production corrigée par année")
+            st.subheader("Production corrigée par année")
             fig2 = px.line(df, x="Année", y="Production corrigée (kWh/an)", markers=True)
             fig2.add_hline(y=arch_production, line_dash="dash", line_color="blue",
                            annotation_text=f"Production Archelios : {arch_production:,.0f} kWh/an")
             st.plotly_chart(fig2, use_container_width=True)
 
-            # --- EXPORT CSV ---
+            # Diagnostic technique
+            with st.expander("🔧 Diagnostic technique"):
+                try:
+                    sample = data["outputs"]["hourly"][0]
+                    st.write(f"Champs disponibles dans l'API : `{list(sample.keys())}`")
+                    st.write(f"Champ utilisé : `{found_field if found_field else 'reconstitution Gb(i)+Gd(i)+Gr(i)'}`")
+                except:
+                    pass
+
+            # Export CSV
             csv = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8")
             st.download_button("📥 Télécharger les résultats (CSV)", data=csv,
                                file_name="correction_ensoleillement.csv", mime="text/csv")
 
-            st.info("💡 Méthode : Production corrigée = Production Archelios × (Gi réel / Gi Archelios)")
+            st.info("💡 Production corrigée = Production Archelios × (Gi réel / Gi Archelios)")
